@@ -1,70 +1,124 @@
-# Asynctask
+# Asynctask (Go)
 
-## Overview
-`Asynctask` is a lightweight library designed to simplify asynchronous tasks in Java with a robust and user-friendly API. It provides a flexible way to handle threading concerns while maintaining clean and readable code.
+> 一个轻量、可取消、带进度汇报的 Go 异步任务框架。
 
-## Features
-- Easy-to-use API for asynchronous tasks.
-- Improved performance with optimized thread handling.
-- Error handling and progress updates.
+## 特性
 
-## Usage Examples
+- **泛型任务定义**：`Task[Params, Progress, Result]`。
+- **可取消**：基于 `context.Context`，支持 `Handle.Cancel()`。
+- **进度汇报**：通过 `ProgressReporter.Report()` 写入进度通道。
+- **两种执行方式**：
+  - 直接 `Start()`：每个任务一个 goroutine。
+  - 通过 `Runner`：worker-pool 执行（可选）。
+- **可控的进度行为**：缓冲大小、满了是阻塞还是丢弃。
+- **panic 转 error（可选）**：避免把 panic 直接炸到调用栈之外。
 
-### Basic Usage
-```java
-AsyncTask<String, Void, String> myTask = new AsyncTask<String, Void, String>() {
-    @Override
-    protected String doInBackground(String... params) {
-        // Perform background operation here
-        return "Result: " + params[0];
-    }
+## 快速开始
 
-    @Override
-    protected void onPostExecute(String result) {
-        // Update UI with the result
-        System.out.println(result);
-    }
-};
+### 基础用法
 
-// Execute the task
-myTask.execute("Hello, World!");
+```go
+package main
+
+import (
+  "context"
+  "fmt"
+  "time"
+
+  "asynctask/asynctask"
+)
+
+func main() {
+  t := asynctask.NewTask[string, struct{}, string](
+    "Hello, World!",
+    func(ctx context.Context, p string, _ asynctask.ProgressReporter[struct{}]) (string, error) {
+      select {
+      case <-ctx.Done():
+        return "", ctx.Err()
+      case <-time.After(50 * time.Millisecond):
+        return "Result: " + p, nil
+      }
+    },
+  )
+
+  h := t.Start(context.Background())
+  res, err := h.Await(context.Background())
+  fmt.Println(res, err)
+}
 ```
 
-### Progress Updates
-```java
-AsyncTask<Void, Integer, Void> progressTask = new AsyncTask<Void, Integer, Void>() {
-    @Override
-    protected Void doInBackground(Void... params) {
-        for (int i = 0; i <= 100; i += 10) {
-            publishProgress(i);
-            try {
-                Thread.sleep(100); // Simulate work
-            } catch (InterruptedException e) {
-                e.printStackTrace();
-            }
+### 进度汇报
+
+```go
+package main
+
+import (
+  "context"
+  "fmt"
+  "time"
+
+  "asynctask/asynctask"
+)
+
+func main() {
+  t := asynctask.NewTask[int, int, string](
+    100,
+    func(ctx context.Context, total int, progress asynctask.ProgressReporter[int]) (string, error) {
+      for i := 0; i <= total; i += 10 {
+        if !progress.Report(i) {
+          return "", ctx.Err()
         }
-        return null;
-    }
+        time.Sleep(20 * time.Millisecond)
+      }
+      return "Task Completed!", nil
+    },
+    asynctask.WithProgressBuffer(8),
+    asynctask.WithProgressMode(asynctask.ProgressDropIfFull),
+  )
 
-    @Override
-    protected void onProgressUpdate(Integer... values) {
-        System.out.println("Progress: " + values[0] + "%");
-    }
+  h := t.Start(context.Background())
 
-    @Override
-    protected void onPostExecute(Void result) {
-        System.out.println("Task Completed!");
+  go func() {
+    for p := range h.Progress() {
+      fmt.Printf("Progress: %d%%\n", p)
     }
-};
+  }()
 
-// Execute the task
-progressTask.execute();
+  res, err := h.Await(context.Background())
+  fmt.Println(res, err)
+}
 ```
 
-For more usage examples and advanced configurations, refer to the [documentation](#).
+## 公共 API 概览
 
-## Contribution
-Contributions are welcome! Fork the repo, make your changes, and submit a pull request.
+### `Task[Params, Progress, Result]`
 
-## License
-This project is licensed under the [MIT License](LICENSE).
+- **构造**：`NewTask(params, fn, ...opts)`
+- **启动**：
+  - `Start(ctx)`：直接起 goroutine
+  - `Submit(ctx, runner)`：丢进 `Runner` worker-pool
+
+### `Handle[Progress, Result]`
+
+- **等待结束**：`Await(ctx)`
+- **取消**：`Cancel()`
+- **完成信号**：`Done() <-chan struct{}`
+- **进度通道**：`Progress() <-chan Progress`
+
+### `Runner`
+
+- **创建**：`NewRunner(workerCount, queueSize)`
+- **关闭并等待**：`Close()`
+
+## 运行示例
+
+```bash
+go run ./examples/basic
+go run ./examples/progress
+```
+
+## 测试
+
+```bash
+go test ./...
+```
