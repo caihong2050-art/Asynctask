@@ -16,7 +16,6 @@ func TestTaskStart_Success(t *testing.T) {
 			return "ok:" + p, nil
 		},
 		WithProgressBuffer(4),
-		WithProgressMode(ProgressBlock),
 	)
 
 	h := task.Start(context.Background())
@@ -61,35 +60,21 @@ func TestTaskStart_Cancel(t *testing.T) {
 	}
 }
 
-func TestTaskSubmit_RunnerClosed(t *testing.T) {
-	r := NewRunner(1, 0)
-	r.Close()
-
-	task := NewTask[int, struct{}, int](
-		1,
-		func(ctx context.Context, p int, _ ProgressReporter[struct{}]) (int, error) {
-			return p + 1, nil
-		},
-	)
-
-	_, err := task.Submit(context.Background(), r)
-	if !errors.Is(err, ErrRunnerClosed) {
-		t.Fatalf("expected ErrRunnerClosed, got %v", err)
-	}
-}
-
 func TestTask_PanicRecovery(t *testing.T) {
 	task := NewTask[int, struct{}, int](
 		1,
 		func(ctx context.Context, p int, _ ProgressReporter[struct{}]) (int, error) {
 			panic("boom")
 		},
-		WithPanicRecovery(true),
 	)
 
 	h := task.Start(context.Background())
 	_, err := h.Await(context.Background())
 	if err == nil {
 		t.Fatalf("expected panic converted to error")
+	}
+	var pe *PanicError
+	if !errors.As(err, &pe) {
+		t.Fatalf("expected PanicError, got %T (%v)", err, err)
 	}
 }

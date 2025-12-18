@@ -3,8 +3,30 @@ package asynctask
 import (
 	"context"
 	"fmt"
+	"runtime/debug"
 	"sync"
 )
+
+type taskConfig struct {
+	progressBuffer int
+}
+
+type Option func(*taskConfig)
+
+// WithProgressBuffer sets the progress channel buffer size (default: 16).
+// If n < 0, it will be treated as 0.
+func WithProgressBuffer(n int) Option {
+	return func(c *taskConfig) {
+		if n < 0 {
+			n = 0
+		}
+		c.progressBuffer = n
+	}
+}
+
+func defaultTaskConfig() taskConfig {
+	return taskConfig{progressBuffer: 16}
+}
 
 // ProgressReporter lets a task publish progress updates.
 // Report returns false if the task context is done.
@@ -17,9 +39,7 @@ type ProgressReporter[Progress any] interface {
 
 type progressReporter[Progress any] struct {
 	ctx  context.Context
-	cfg  taskConfig
 	ch   chan Progress
-	once sync.Once
 }
 
 func (r *progressReporter[Progress]) Context() context.Context { return r.ctx }
@@ -31,31 +51,15 @@ func (r *progressReporter[Progress]) Report(p Progress) bool {
 	default:
 	}
 
-	switch r.cfg.progressMode {
-	case ProgressBlock:
-		select {
-		case <-r.ctx.Done():
-			return false
-		case r.ch <- p:
-			return true
-		}
-	case ProgressDropIfFull:
-		select {
-		case <-r.ctx.Done():
-			return false
-		case r.ch <- p:
-			return true
-		default:
-			return true
-		}
+	// Production default: never block the worker when progress buffer is full.
+	// If the receiver is slow, progress events are dropped.
+	select {
+	case <-r.ctx.Done():
+		return false
+	case r.ch <- p:
+		return true
 	default:
-		// Fallback: drop.
-		select {
-		case r.ch <- p:
-			return true
-		default:
-			return true
-		}
+		return true
 	}
 }
 
@@ -66,6 +70,16 @@ func (r *progressReporter[Progress]) Report(p Progress) bool {
 // - Use progress.Report to publish progress updates (optional).
 // - Return (result, nil) on success; (zero, err) on failure.
 type Func[Params, Progress, Result any] func(ctx context.Context, params Params, progress ProgressReporter[Progress]) (Result, error)
+
+// PanicError is returned when a task panics (the panic is recovered).
+type PanicError struct {
+	Value any
+	Stack []byte
+}
+
+func (e *PanicError) Error() string {
+	return fmt.Sprintf("asynctask: panic: %v", e.Value)
+}
 
 // Handle represents a running (or finished) task.
 //
@@ -123,7 +137,7 @@ func (h *Handle[Progress, Result]) Result() (res Result, err error, ok bool) {
 
 // Task defines an async computation with progress reporting.
 //
-// Task itself is reusable; each Start/Submit creates a new Handle.
+// Task itself is reusable; each Start creates a new Handle.
 type Task[Params, Progress, Result any] struct {
 	params Params
 	fn     Func[Params, Progress, Result]
@@ -131,7 +145,7 @@ type Task[Params, Progress, Result any] struct {
 }
 
 // NewTask constructs a task.
-func NewTask[Params, Progress, Result any](params Params, fn Func[Params, Progress, Result], opts ...TaskOption) *Task[Params, Progress, Result] {
+func NewTask[Params, Progress, Result any](params Params, fn Func[Params, Progress, Result], opts ...Option) *Task[Params, Progress, Result] {
 	cfg := defaultTaskConfig()
 	for _, o := range opts {
 		o(&cfg)
@@ -152,56 +166,28 @@ func (t *Task[Params, Progress, Result]) Start(ctx context.Context) *Handle[Prog
 	return h
 }
 
-// Submit runs the task on a Runner worker pool.
-func (t *Task[Params, Progress, Result]) Submit(ctx context.Context, r *Runner) (*Handle[Progress, Result], error) {
-	ctx2, cancel := context.WithCancel(ctx)
-	h := &Handle[Progress, Result]{
-		done:     make(chan struct{}),
-		progress: make(chan Progress, t.cfg.progressBuffer),
-		cancel:   cancel,
-	}
-
-	j := taskJob[Params, Progress, Result]{t: t, ctx: ctx2, h: h}
-	if err := r.Submit(j); err != nil {
-		cancel()
-		close(h.progress)
-		close(h.done)
-		return nil, err
-	}
-	return h, nil
-}
-
-type taskJob[Params, Progress, Result any] struct {
-	t   *Task[Params, Progress, Result]
-	ctx context.Context
-	h   *Handle[Progress, Result]
-}
-
-func (j taskJob[Params, Progress, Result]) run() { j.t.run(j.ctx, j.h) }
-
 func (t *Task[Params, Progress, Result]) run(ctx context.Context, h *Handle[Progress, Result]) {
-	reporter := &progressReporter[Progress]{ctx: ctx, cfg: t.cfg, ch: h.progress}
+	reporter := &progressReporter[Progress]{ctx: ctx, ch: h.progress}
+
+	var (
+		res Result
+		err error
+	)
 
 	defer func() {
-		// Ensure progress channel is closed after completion.
+		if r := recover(); r != nil {
+			err = &PanicError{Value: r, Stack: debug.Stack()}
+		}
+
+		h.mu.Lock()
+		h.result = res
+		h.err = err
+		h.mu.Unlock()
+
+		// Ensure channels are closed after completion.
 		close(h.progress)
 		close(h.done)
 	}()
 
-	if t.cfg.recoverPanics {
-		defer func() {
-			if r := recover(); r != nil {
-				h.mu.Lock()
-				defer h.mu.Unlock()
-				h.err = fmt.Errorf("asynctask: panic: %v", r)
-			}
-		}()
-	}
-
-	res, err := t.fn(ctx, t.params, reporter)
-
-	h.mu.Lock()
-	h.result = res
-	h.err = err
-	h.mu.Unlock()
+	res, err = t.fn(ctx, t.params, reporter)
 }
