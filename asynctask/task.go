@@ -44,7 +44,17 @@ type progressReporter[Progress any] struct {
 
 func (r *progressReporter[Progress]) Context() context.Context { return r.ctx }
 
-func (r *progressReporter[Progress]) Report(p Progress) bool {
+func (r *progressReporter[Progress]) Report(p Progress) (ok bool) {
+	// Defensive: users may (accidentally) call Report from another goroutine
+	// after the task completes and the progress channel is closed.
+	// Sending on a closed channel would panic and crash the process; we convert
+	// that to a "false" return instead.
+	defer func() {
+		if recover() != nil {
+			ok = false
+		}
+	}()
+
 	select {
 	case <-r.ctx.Done():
 		return false
@@ -83,7 +93,8 @@ func (e *PanicError) Error() string {
 
 // Handle represents a running (or finished) task.
 //
-// Read Progress() until Done() is closed; Progress() will be closed afterwards.
+// Progress() is closed when the task finishes; Done() is closed afterwards.
+// Consumers can safely range over Progress() and/or select on Done().
 type Handle[Progress, Result any] struct {
 	done     chan struct{}
 	progress chan Progress
@@ -112,13 +123,22 @@ func (h *Handle[Progress, Result]) Cancel() {
 // If ctx is canceled first, it returns ctx.Err().
 func (h *Handle[Progress, Result]) Await(ctx context.Context) (Result, error) {
 	select {
-	case <-ctx.Done():
-		var zero Result
-		return zero, ctx.Err()
 	case <-h.done:
 		h.mu.Lock()
 		defer h.mu.Unlock()
 		return h.result, h.err
+	case <-ctx.Done():
+		// Prefer returning the task result if it already completed,
+		// even if the provided ctx is canceled at the same time.
+		select {
+		case <-h.done:
+			h.mu.Lock()
+			defer h.mu.Unlock()
+			return h.result, h.err
+		default:
+			var zero Result
+			return zero, ctx.Err()
+		}
 	}
 }
 
@@ -155,14 +175,7 @@ func NewTask[Params, Progress, Result any](params Params, fn Func[Params, Progre
 
 // Start runs the task on a new goroutine.
 func (t *Task[Params, Progress, Result]) Start(ctx context.Context) *Handle[Progress, Result] {
-	ctx2, cancel := context.WithCancel(ctx)
-	h := &Handle[Progress, Result]{
-		done:     make(chan struct{}),
-		progress: make(chan Progress, t.cfg.progressBuffer),
-		cancel:   cancel,
-	}
-
-	go t.run(ctx2, h)
+	h, _ := t.StartOn(ctx, GoExecutor{})
 	return h
 }
 
@@ -190,4 +203,41 @@ func (t *Task[Params, Progress, Result]) run(ctx context.Context, h *Handle[Prog
 	}()
 
 	res, err = t.fn(ctx, t.params, reporter)
+}
+
+// StartOn runs the task using the provided executor (infrastructure).
+//
+// This is the extensibility seam: you can plug in a worker pool, a bounded queue,
+// a custom scheduler, etc., without changing the domain function.
+func (t *Task[Params, Progress, Result]) StartOn(ctx context.Context, exec Executor) (*Handle[Progress, Result], error) {
+	ctx2, cancel := context.WithCancel(ctx)
+	h := &Handle[Progress, Result]{
+		done:     make(chan struct{}),
+		progress: make(chan Progress, t.cfg.progressBuffer),
+		cancel:   cancel,
+	}
+
+	if exec == nil {
+		// Fail-fast with a completed handle (so callers don't block forever).
+		cancel()
+		h.mu.Lock()
+		h.err = ErrNilExecutor
+		h.mu.Unlock()
+		close(h.progress)
+		close(h.done)
+		return h, ErrNilExecutor
+	}
+
+	if err := exec.TryExecute(func() { t.run(ctx2, h) }); err != nil {
+		// Ensure we don't leak a derived context / handle when scheduling fails.
+		cancel()
+		h.mu.Lock()
+		h.err = err
+		h.mu.Unlock()
+		close(h.progress)
+		close(h.done)
+		return h, err
+	}
+
+	return h, nil
 }
