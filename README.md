@@ -1,21 +1,26 @@
 # Asynctask (Go)
 
-> 一个轻量、可取消、带进度汇报的 Go 异步任务框架。
+一个**可上生产**的极简 Go 异步任务小框架：只实现核心能力——**取消、等待结果、进度通道**。
 
-## 特性
+## 核心设计（为什么适合生产）
 
-- **泛型任务定义**：`Task[Params, Progress, Result]`。
-- **可取消**：基于 `context.Context`，支持 `Handle.Cancel()`。
-- **进度汇报**：通过 `ProgressReporter.Report()` 写入进度通道。
-- **两种执行方式**：
-  - 直接 `Start()`：每个任务一个 goroutine。
-  - 通过 `Runner`：worker-pool 执行（可选）。
-- **可控的进度行为**：缓冲大小、满了是阻塞还是丢弃。
-- **panic 转 error（可选）**：避免把 panic 直接炸到调用栈之外。
+- **取消**：完全基于 `context.Context`，不会自造一套取消机制。
+- **不阻塞进度**：进度通道满时会**丢弃**事件，避免慢消费者拖死任务线程。
+- **panic 安全**：任务函数 panic 会被 recover 并转成 `*asynctask.PanicError`，避免后台 goroutine 直接把进程打崩。
 
-## 快速开始
+## 公共 API（只有核心）
 
-### 基础用法
+- `NewTask[Params, Progress, Result](params, fn, ...opts) *Task`
+- `(*Task).Start(ctx) *Handle`
+- `(*Handle).Progress() <-chan Progress`
+- `(*Handle).Done() <-chan struct{}`
+- `(*Handle).Await(ctx) (Result, error)`
+- `(*Handle).Cancel()`
+- `WithProgressBuffer(n int)`：设置进度通道缓冲（默认 16）
+
+## 示例
+
+### 1) 基础用法
 
 ```go
 package main
@@ -47,7 +52,7 @@ func main() {
 }
 ```
 
-### 进度汇报
+### 2) 进度汇报
 
 ```go
 package main
@@ -73,7 +78,6 @@ func main() {
       return "Task Completed!", nil
     },
     asynctask.WithProgressBuffer(8),
-    asynctask.WithProgressMode(asynctask.ProgressDropIfFull),
   )
 
   h := t.Start(context.Background())
@@ -89,28 +93,7 @@ func main() {
 }
 ```
 
-## 公共 API 概览
-
-### `Task[Params, Progress, Result]`
-
-- **构造**：`NewTask(params, fn, ...opts)`
-- **启动**：
-  - `Start(ctx)`：直接起 goroutine
-  - `Submit(ctx, runner)`：丢进 `Runner` worker-pool
-
-### `Handle[Progress, Result]`
-
-- **等待结束**：`Await(ctx)`
-- **取消**：`Cancel()`
-- **完成信号**：`Done() <-chan struct{}`
-- **进度通道**：`Progress() <-chan Progress`
-
-### `Runner`
-
-- **创建**：`NewRunner(workerCount, queueSize)`
-- **关闭并等待**：`Close()`
-
-## 运行示例
+## 运行
 
 ```bash
 go run ./examples/basic
